@@ -1,0 +1,216 @@
+name: Build
+on: [push, pull_request]
+permissions:
+  contents: write
+env:
+  DEPOT_DOWNLOADER_VERSION: "3.4.0"
+  APP_ID: "294420"
+  DEPOT_ID: "294422"
+  MANIFEST_ID: "4777960841829662519"
+jobs:
+  Build:
+    name: Build
+    if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: cmd
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Fetch tags
+      run: |
+        git fetch --tags --force
+      shell: cmd
+      
+    - name: Setup build info (Windows)
+      env:
+        COMMIT_SHA: ${{ github.sha }}
+        BRANCH_NAME: ${{ github.ref_name }}
+      run: |
+          # Log working directory and environment
+          echo "Working directory: $PWD" | Out-Host
+          echo "Branch name: $env:BRANCH_NAME" | Out-Host
+          # Determine version
+          if ($env:BRANCH_NAME -like 'release/*') {
+            $version = $env:BRANCH_NAME -replace '^release/', ''
+            echo "Release branch version (raw): $version" | Out-Host
+          } else {
+            $gitOutput = (git describe --tags --abbrev=0 2>&1)
+            echo "git describe output: $gitOutput" | Out-Host
+            $latestTag = ($gitOutput | Select-String -NotMatch "fatal").Line
+            if ($latestTag) {
+              $version = $latestTag
+              echo "Found tag: $latestTag" | Out-Host
+            } else {
+              $version = "0.0.0"
+              echo "No tags found, defaulting to version 0.0.0" | Out-Host
+            }
+          }
+          # Validate version format (x.y.z)
+          if ($version -match '^\d+\.\d+\.\d+$') {
+            echo "BUILD_VERSION=$version" >> $env:GITHUB_ENV
+            echo "Valid version: $version" | Out-Host
+          } else {
+            $version = "0.9.5"
+            echo "BUILD_VERSION=$version" >> $env:GITHUB_ENV
+            echo "Invalid version format, defaulting to 0.9.5" | Out-Host
+          }
+          # Set commit hash (first 12 characters)
+          $sha12 = $env:COMMIT_SHA.Substring(0,12)
+          echo "COMMIT_SHA=$sha12" >> $env:GITHUB_ENV
+          echo "Commit SHA: $sha12" | Out-Host
+          # Update BuildInfo.cs
+          $buildInfoFile = "$env:GITHUB_WORKSPACE\WalkerSim\BuildInfo.cs"
+          echo "BuildInfo.cs path: $buildInfoFile" | Out-Host
+          if (-Not (Test-Path $buildInfoFile)) {
+            echo "Error: $buildInfoFile does not exist" | Out-Host
+            dir -Recurse | Where-Object { $_.Name -eq "BuildInfo.cs" } | ForEach-Object { echo "Found BuildInfo.cs at: $($_.FullName)" } | Out-Host
+            exit 1
+          }
+          # Log BuildInfo.cs content before update
+          echo "BuildInfo.cs content before update:" | Out-Host
+          Get-Content -Path $buildInfoFile | Out-Host
+          # Perform replacements
+          $content = Get-Content -Path $buildInfoFile -Raw
+          $content = $content -replace '\[assembly: AssemblyMetadata\("Commit", "[^"]*"\)\]', "[assembly: AssemblyMetadata(`"Commit`", `"$sha12`")]"
+          $content = $content -replace '\[assembly: AssemblyVersion\("[^"]*"\)\]', "[assembly: AssemblyVersion(`"$version`")]"
+          $content = $content -replace '\[assembly: AssemblyFileVersion\("[^"]*"\)\]', "[assembly: AssemblyFileVersion(`"$version.0`")]"
+          Set-Content -Path $buildInfoFile -Value $content
+          # Log BuildInfo.cs content after update
+          echo "BuildInfo.cs content after update:" | Out-Host
+          Get-Content -Path $buildInfoFile | Out-Host
+      shell: powershell
+
+    - name: Cache DepotDownloader
+      id: cache-depotdownloader
+      uses: actions/cache@v4
+      with:
+        path: tools
+        key: depotdownloader-${{ env.DEPOT_DOWNLOADER_VERSION }}
+
+    - name: Fetch DepotDownloader
+      if: steps.cache-depotdownloader.outputs.cache-hit != 'true'
+      run: |
+        curl.exe -LO https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_${{ env.DEPOT_DOWNLOADER_VERSION }}/DepotDownloader-windows-x64.zip
+        mkdir tools
+        tar -xf DepotDownloader-windows-x64.zip -C tools
+        del DepotDownloader-windows-x64.zip
+
+    - name: Generate hash of required_files.txt
+      id: hash-files
+      run: |
+        $hash = (Get-FileHash -Path .\Binaries\required_files.txt -Algorithm SHA256).Hash
+        echo "FILE_HASH=$hash" >> $env:GITHUB_ENV
+      shell: powershell
+
+    - name: Cache required binaries
+      id: cache-binaries
+      uses: actions/cache@v4
+      with:
+        path: Binaries
+        key: binaries-${{ env.APP_ID }}-${{ env.DEPOT_ID }}-${{ env.MANIFEST_ID }}-${{ env.FILE_HASH }}
+
+    - name: Fetch required binaries
+      if: steps.cache-binaries.outputs.cache-hit != 'true'
+      run: |
+        mkdir temp
+        .\tools\DepotDownloader.exe -app "${{ env.APP_ID }}" -depot "${{ env.DEPOT_ID }}" -manifest "${{ env.MANIFEST_ID }}" -filelist .\Binaries\required_files.txt -dir .\temp
+        for /F "delims=" %%f in (.\Binaries\required_files.txt) do (
+            set "file=%%f"
+            setlocal enabledelayedexpansion
+            set "file=!file:/=\!"
+            move /Y ".\temp\!file!" ".\Binaries\"
+            endlocal
+        )
+        rmdir /S /Q temp
+
+    - name: Generate hash of NuGet dependencies
+      id: hash-nuget
+      run: |
+        $files = Get-ChildItem -Path . -Recurse -Include *.csproj
+        if ($files.Count -eq 0) {
+          $combinedHash = "no-csproj-files"
+        } else {
+          $hashes = $files | ForEach-Object { (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash }
+          $combinedString = $hashes -join ''
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($combinedString)
+          $hashBytes = $sha256.ComputeHash($bytes)
+          $combinedHash = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLower()
+        }
+        echo "NUGET_HASH=$combinedHash" >> $env:GITHUB_ENV
+      shell: powershell
+
+    - name: Cache NuGet packages
+      id: cache-nuget
+      uses: actions/cache@v4
+      with:
+        path: ~\.nuget\packages
+        key: nuget-${{ runner.os }}-${{ env.NUGET_HASH }}
+        restore-keys: |
+          nuget-${{ runner.os }}-
+
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v2.0.0
+
+    - name: Setup Nuget
+      uses: Nuget/setup-nuget@v2.0.0
+
+    - name: Restore nuget packages
+      run: nuget restore WalkerSim2.sln
+
+    - name: Build
+      run: |
+        msbuild WalkerSim2.sln -t:rebuild -property:Configuration=Release
+
+    - name: Run tests
+      uses: josepho0918/vstest-action@e6f6fd4212c7e41d549732d346865cf0d0afbf33
+      with:
+        testAssembly: |
+          /**/*test*.dll
+          !./**/*TestAdapter.dll
+          !./**/obj/**
+        searchFolder: ./Build/Release/Tests
+        runInParallel: true
+
+    - name: Prepare artifacts
+      id: prepare-artifacts
+      run: |
+        mkdir artifact
+        mkdir artifact\Mods
+        mkdir artifact\Mods\WalkerSim2
+        echo .pdb > exclude.txt
+        xcopy /I /Y /F ".\Build\Release\*" ".\artifact\Mods\WalkerSim2\" /EXCLUDE:exclude.txt
+        del exclude.txt
+
+    - name: Publish artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: WalkerSim2-${{ env.BUILD_VERSION }}${{ startsWith(github.ref, 'refs/heads/release/') && '' || '-' }}${{ env.COMMIT_SHA }}
+        path: |
+          ./artifact/**/*
+
+    - name: Prepare release
+      if: startsWith(github.ref, 'refs/heads/release/')
+      run: |
+        $zipFileName = "WalkerSim2-${{ env.BUILD_VERSION }}.zip"
+        $sourceDirectory = ".\artifact"
+        Compress-Archive -Path $sourceDirectory\* -DestinationPath $zipFileName
+        echo "Created $zipFileName"
+      id: prepare-release
+      shell: powershell
+
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/heads/release/')
+      with:
+        name: ${{ env.BUILD_VERSION }}
+        tag_name: ${{ env.BUILD_VERSION }}
+        make_latest: true
+        generate_release_notes: false
+        files: |
+          WalkerSim2-${{ env.BUILD_VERSION }}.zip

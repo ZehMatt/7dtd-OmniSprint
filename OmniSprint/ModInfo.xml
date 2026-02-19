@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<xml>
+  <Name value="OmniSprint" />
+  <DisplayName value="OmniSprint" />
+  <Description value="Sprint in any direction" />
+  <Author value="ZehMatt" />
+  <Version value="1.0.0.0" />
+  <Website value="https://github.com/ZehMatt/7dtd-OmniSprint" />
+  <SkipWithAntiCheat value="true" />
+</xml>
