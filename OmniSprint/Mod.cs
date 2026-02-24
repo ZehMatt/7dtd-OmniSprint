@@ -206,8 +206,18 @@ namespace Omni
     [HarmonyPatch(typeof(PlayerMoveController), "Update")]
     static class Patch_PlayerMoveController_Update
     {
+        static bool prevToggle;
+        static bool skipNextRelease;
+
+        public static void Prefix(PlayerMoveController __instance)
+        {
+            if (__instance != null)
+                prevToggle = __instance.runToggleActive;
+        }
+
         public static void Postfix(PlayerMoveController __instance)
         {
+            bool wasActive = prevToggle;
             try
             {
                 var playerInput = __instance.playerInput;
@@ -222,8 +232,16 @@ namespace Omni
                                  || playerInput.MoveLeft.IsPressed
                                  || playerInput.MoveRight.IsPressed;
 
-                // quick-tap/run-release -> toggle guard (allow omni-directional movement)
-                if (playerInput.Run.WasReleased && !__instance.runToggleActive && __instance.runInputTime < 0.2f)
+                if (__instance.sprintMode == 1 && __instance.runToggleActive && playerInput.Run.WasPressed)
+                {
+                    __instance.runToggleActive = false;
+                    __instance.runPressedWhileActive = false;
+                    if (__instance.entityPlayerLocal != null)
+                        __instance.entityPlayerLocal.movementInput.running = false;
+                    skipNextRelease = true;
+                }
+
+                if (playerInput.Run.WasReleased && !__instance.runToggleActive && __instance.runInputTime < 0.2f && !wasActive && !skipNextRelease)
                 {
                     if (isAnyMove || __instance.sprintMode == 1)
                     {
@@ -232,6 +250,8 @@ namespace Omni
                             __instance.entityPlayerLocal.movementInput.running = true;
                     }
                 }
+                if (playerInput.Run.WasReleased)
+                    skipNextRelease = false;
 
                 // when toggle is active, stop it if player stops moving (replace forward-only release check)
                 if (__instance.runToggleActive)
